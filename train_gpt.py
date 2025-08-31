@@ -5,6 +5,34 @@ from flax import linen as nn
 from flax.training import train_state
 import dataclasses
 import optax
+import glob
+import numpy as np
+
+
+class DataLoader:
+  def __init__(self, batch_size, seq_len, data_dir="fineweb10B"):
+    self.B = batch_size
+    self.L = seq_len
+    self.data_dir = data_dir
+
+    train_files = sorted(glob.glob(os.path.join(self.data_dir, "fineweb_train_*.bin")))
+    if not train_files:
+      raise FileNotFoundError(
+          f"No training data found in {self.data_dir}"
+      )
+    
+    self.train_chunks = [np.memmap(f, dtype=np.uint16, mode='r') for f in train_files]
+    
+
+  def __iter__(self):
+    while True:
+      chunk_idx = np.random.randint(0, len(self.train_chunks))
+      chunk = self.train_chunks[chunk_idx]
+
+      starts = np.random.randint(0, len(chunk) - self.L, size=self.B) 
+      x = np.array([chunk[s : s + self.L] for s in starts])
+      yield x
+
 
 @dataclasses.dataclass
 class Config:
@@ -129,38 +157,42 @@ def train_step(state: train_state.TrainState, batch: jax.Array):
 
   return state, loss
 
-#if __name__ == 'main':
-BATCH_SIZE = 8
-LEARNING_RATE = 1e-3
-TRAINING_STEPS = 1000
-
-cfg = Config(
-    D=256,
-    H=4,
-    L=128,
-    N=4,
-    V=1000,
-    F=4 * 256
-)
-
-key = jax.random.PRNGKey(0)
-key, init_key = jax.random.split(key)
-
-state = create_train_state(init_key, cfg, LEARNING_RATE)
-
-print(jax.default_backend())   # 'cpu', 'gpu', or 'tpu'
-print(jax.devices())        # Device(id=0, process_index=0, platform='gpu')
-print("Start Training")
-for step in range(TRAINING_STEPS):
-  key, data_key = jax.random.split(key)
-
-  dummy_batch = jax.random.randint(
-      key=data_key,
-      shape=(BATCH_SIZE, cfg.L),
-      minval=0,
-      maxval=cfg.V
+if __name__ == 'main':
+  BATCH_SIZE = 8
+  LEARNING_RATE = 3e-4
+  TRAINING_STEPS = 1000
+  
+  cfg = Config(
+      D=256,
+      H=4,
+      L=128,
+      N=4,
+      V=50257,
+      F=4 * 256
   )
-
-  state, loss = train_step(state, dummy_batch)
-  if step % 100 == 0:
-    print(f"Step: {step}, Loss: {loss}")
+  
+  dataloader = DataLoader(BATCH_SIZE, cfg.L)
+  data_iter = iter(dataloader)
+  
+  key = jax.random.PRNGKey(0)
+  key, init_key = jax.random.split(key)
+  
+  state = create_train_state(init_key, cfg, LEARNING_RATE)
+  
+  print(jax.default_backend())   # 'cpu', 'gpu', or 'tpu'
+  print(jax.devices())        # Device(id=0, process_index=0, platform='gpu')
+  print("Start Training")
+  for step in range(TRAINING_STEPS):
+    key, data_key = jax.random.split(key)
+  
+    batch = jnp.asarray(next(data_iter))
+    # dummy_batch = jax.random.randint(
+    #     key=data_key,
+    #     shape=(BATCH_SIZE, cfg.L),
+    #     minval=0,
+    #     maxval=cfg.V
+    # )
+  
+    state, loss = train_step(state, batch)
+    if step % 100 == 0:
+      print(f"Step: {step}, Loss: {loss}")
