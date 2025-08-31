@@ -73,20 +73,37 @@ class SelfAttention(nn.Module):
         multilinear(name='value')(x_BLD)
     )
 
-    q_BLHDh *= Dh ** 0.5
+    q_BHLDh = jnp.transpose(q_BLHDh, (0, 2, 1, 3))
+    k_BHLDh = jnp.transpose(k_BLHDh, (0, 2, 1, 3))
+    v_BHLDh = jnp.transpose(v_BLHDh, (0, 2, 1, 3))
 
-    attn_BHLL = jnp.einsum('...qhd,...khd->...hqk', q_BLHDh, k_BLHDh)
-    # cast to fp32 for softmax (exp why?)
-    attn_BHLL = attn_BHLL.astype(jnp.float32)
 
-    L = x_BLD.shape[1]
-    mask_11LL = jnp.tril(jnp.ones((1, 1, L, L), dtype=jnp.bool_))
 
-    _NEG_INF = jnp.finfo(cfg.dtype).min
-    attn_BHLL = jnp.where(mask_11LL, attn_BHLL, _NEG_INF)
-    attn_BHLL = nn.softmax(attn_BHLL, axis=-1)
-    attn_BHLL = attn_BHLL.astype(cfg.dtype)
-    out_BLHDh = jnp.einsum('...hqk,...khd->...qhd', attn_BHLL, v_BLHDh)
+    # q_BLHDh *= Dh ** 0.5
+
+    # attn_BHLL = jnp.einsum('...qhd,...khd->...hqk', q_BLHDh, k_BLHDh)
+    # # cast to fp32 for softmax (exp why?)
+    # attn_BHLL = attn_BHLL.astype(jnp.float32)
+
+    # L = x_BLD.shape[1]
+    # mask_11LL = jnp.tril(jnp.ones((1, 1, L, L), dtype=jnp.bool_))
+
+    # _NEG_INF = jnp.finfo(cfg.dtype).min
+    # attn_BHLL = jnp.where(mask_11LL, attn_BHLL, _NEG_INF)
+    # attn_BHLL = nn.softmax(attn_BHLL, axis=-1)
+    # attn_BHLL = attn_BHLL.astype(cfg.dtype)
+    # out_BLHDh = jnp.einsum('...hqk,...khd->...qhd', attn_BHLL, v_BLHDh)
+
+    out_BHLDh = jax.nn.dot_product_attention(
+        q_BHLDh,
+        k_BHLDh,
+        v_BHLDh,
+        bias=None,
+        mask=None,
+        is_causal=True,
+    )
+
+    out_BLHDh = jnp.transpose(out_BHLDh, (0, 2, 1, 3))
 
     return nn.DenseGeneral(axis=(-2,-1), features=cfg.D, name='attn_out_proj', use_bias=False, dtype=cfg.dtype)(out_BLHDh)
 
@@ -160,15 +177,15 @@ def train_step(state: train_state.TrainState, batch: jax.Array):
 if __name__ == 'main':
   BATCH_SIZE = 8
   LEARNING_RATE = 3e-4
-  TRAINING_STEPS = 1000
+  TRAINING_STEPS = 10000
   
   cfg = Config(
-      D=256,
-      H=4,
-      L=128,
-      N=4,
+      D=768,
+      H=6,
+      L=1024,
+      N=12,
       V=50257,
-      F=4 * 256
+      F=4 * 768
   )
   
   dataloader = DataLoader(BATCH_SIZE, cfg.L)
@@ -186,12 +203,6 @@ if __name__ == 'main':
     key, data_key = jax.random.split(key)
   
     batch = jnp.asarray(next(data_iter))
-    # dummy_batch = jax.random.randint(
-    #     key=data_key,
-    #     shape=(BATCH_SIZE, cfg.L),
-    #     minval=0,
-    #     maxval=cfg.V
-    # )
   
     state, loss = train_step(state, batch)
     if step % 100 == 0:
