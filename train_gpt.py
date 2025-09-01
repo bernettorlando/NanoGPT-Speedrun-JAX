@@ -8,6 +8,7 @@ import optax
 import glob
 import numpy as np
 from flax.jax_utils import replicate
+import os
 
 
 class DataLoader:
@@ -160,7 +161,7 @@ def train_step(state: train_state.TrainState, batch: jax.Array):
 
   return state, loss
 
-if __name__ == 'main':
+if __name__ == '__main__':
   BATCH_SIZE = 8
   LEARNING_RATE = 3e-4
   TRAINING_STEPS = 10000
