@@ -7,6 +7,7 @@ import dataclasses
 import optax
 import glob
 import numpy as np
+from flax.jax_utils import replicate
 
 
 class DataLoader:
@@ -77,23 +78,6 @@ class SelfAttention(nn.Module):
     k_BHLDh = jnp.transpose(k_BLHDh, (0, 2, 1, 3))
     v_BHLDh = jnp.transpose(v_BLHDh, (0, 2, 1, 3))
 
-
-
-    # q_BLHDh *= Dh ** 0.5
-
-    # attn_BHLL = jnp.einsum('...qhd,...khd->...hqk', q_BLHDh, k_BLHDh)
-    # # cast to fp32 for softmax (exp why?)
-    # attn_BHLL = attn_BHLL.astype(jnp.float32)
-
-    # L = x_BLD.shape[1]
-    # mask_11LL = jnp.tril(jnp.ones((1, 1, L, L), dtype=jnp.bool_))
-
-    # _NEG_INF = jnp.finfo(cfg.dtype).min
-    # attn_BHLL = jnp.where(mask_11LL, attn_BHLL, _NEG_INF)
-    # attn_BHLL = nn.softmax(attn_BHLL, axis=-1)
-    # attn_BHLL = attn_BHLL.astype(cfg.dtype)
-    # out_BLHDh = jnp.einsum('...hqk,...khd->...qhd', attn_BHLL, v_BLHDh)
-
     out_BHLDh = jax.nn.dot_product_attention(
         q_BHLDh,
         k_BHLDh,
@@ -102,7 +86,6 @@ class SelfAttention(nn.Module):
         mask=None,
         is_causal=True,
     )
-
     out_BLHDh = jnp.transpose(out_BHLDh, (0, 2, 1, 3))
 
     return nn.DenseGeneral(axis=(-2,-1), features=cfg.D, name='attn_out_proj', use_bias=False, dtype=cfg.dtype)(out_BLHDh)
@@ -160,7 +143,8 @@ def create_train_state(key: jax.Array, cfg: Config, learning_rate: float) -> tra
 def loss_fn(logits, labels):
   return optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
 
-@jax.jit
+#@jax.jit
+@partial(jax.pmap, axis_name='batch')
 def train_step(state: train_state.TrainState, batch: jax.Array):
   inputs = batch[:, :-1]
   labels = batch[:, 1:]
@@ -170,6 +154,8 @@ def train_step(state: train_state.TrainState, batch: jax.Array):
     return loss_fn(logits, labels)
   
   loss, grads = jax.value_and_grad(compute_loss)(state.params)
+  grads = jax.lax.pmean(grads, axis_name='batch')
+
   state = state.apply_gradients(grads=grads)
 
   return state, loss
@@ -195,15 +181,17 @@ if __name__ == 'main':
   key, init_key = jax.random.split(key)
   
   state = create_train_state(init_key, cfg, LEARNING_RATE)
+  state = replicate(state)
   
-  print(jax.default_backend())   # 'cpu', 'gpu', or 'tpu'
-  print(jax.devices())        # Device(id=0, process_index=0, platform='gpu')
+  num_devices = jax.local_device_count()
+  
   print("Start Training")
   for step in range(TRAINING_STEPS):
     key, data_key = jax.random.split(key)
   
     batch = jnp.asarray(next(data_iter))
+    sharded_batch = batch.reshape(num_devices, -1, batch.shape[-1])
   
-    state, loss = train_step(state, batch)
+    state, loss = train_step(state, sharded_batch)
     if step % 100 == 0:
       print(f"Step: {step}, Loss: {loss}")
