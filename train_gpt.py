@@ -101,7 +101,7 @@ class Block(nn.Module):
     x_BLD += in_BLD
 
     z_BLD = nn.LayerNorm(use_bias=False, dtype=self.cfg.dtype)(x_BLD)
-    z_BLD = MLP(self.cfg)(x_BLD)
+    z_BLD = MLP(self.cfg)(z_BLD)
 
     return x_BLD + z_BLD
 
@@ -188,7 +188,7 @@ if __name__ == '__main__':
   
   cfg = Config(
       D=768,
-      H=6,
+      H=12,
       L=1024,
       N=12,
       V=50257,
@@ -233,4 +233,4 @@ if __name__ == '__main__':
       val_loss_accumulator /= VAL_STEPS
       final_val_loss = average_across_devices(val_loss_accumulator)
   
-      print(f"Step: {step}, Val Loss: {loss[0]:.4f}")
+      print(f"Step: {step}, Val Loss: {final_val_loss[0]:.4f}")
