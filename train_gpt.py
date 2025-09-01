@@ -178,7 +178,7 @@ def eval_step(state: train_state.TrainState, batch: jax.Array):
 def average_across_devices(x):
   return jax.lax.pmean(x, axis_name='batch')
 
-if __name__ == 'main':
+if __name__ == '__main__':
   BATCH_SIZE = 8
   LEARNING_RATE = 3e-4
   TRAINING_STEPS = 10000
@@ -200,7 +200,7 @@ if __name__ == 'main':
   dataloader = DataLoader(num_devices * BATCH_SIZE, cfg.L)
   data_iter = iter(dataloader)
   
-  val_dataloader = DataLoader(num_devices * BATCH_SIZE, cfg.L)
+  val_dataloader = DataLoader(num_devices * BATCH_SIZE, cfg.L, split="val")
   val_data_iter = iter(val_dataloader)
   
   key = jax.random.PRNGKey(0)
