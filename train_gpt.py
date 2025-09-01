@@ -12,15 +12,15 @@ import os
 
 
 class DataLoader:
-  def __init__(self, batch_size, seq_len, data_dir="fineweb10B"):
+  def __init__(self, batch_size, seq_len, split="train", data_dir="fineweb10B"):
     self.B = batch_size
     self.L = seq_len
     self.data_dir = data_dir
 
-    train_files = sorted(glob.glob(os.path.join(self.data_dir, "fineweb_train_*.bin")))
+    train_files = sorted(glob.glob(os.path.join(self.data_dir, f"fineweb_{split}_*.bin")))
     if not train_files:
       raise FileNotFoundError(
-          f"No training data found in {self.data_dir}"
+          f"No {split} data found in {self.data_dir}"
       )
     
     self.train_chunks = [np.memmap(f, dtype=np.uint16, mode='r') for f in train_files]
@@ -155,16 +155,36 @@ def train_step(state: train_state.TrainState, batch: jax.Array):
     return loss_fn(logits, labels)
   
   loss, grads = jax.value_and_grad(compute_loss)(state.params)
+
   grads = jax.lax.pmean(grads, axis_name='batch')
+  loss = jax.lax.pmean(loss, axis_name='batch')
 
   state = state.apply_gradients(grads=grads)
 
   return state, loss
 
-if __name__ == '__main__':
+@partial(jax.pmap, axis_name='batch')
+def eval_step(state: train_state.TrainState, batch: jax.Array):
+  inputs = batch[:, :-1]
+  labels = batch[:, 1:]
+
+  logits = state.apply_fn({'params': state.params}, inputs)
+  loss = loss_fn(logits, labels)
+
+  return loss
+
+
+@partial(jax.pmap, axis_name='batch')
+def average_across_devices(x):
+  return jax.lax.pmean(x, axis_name='batch')
+
+if __name__ == 'main':
   BATCH_SIZE = 8
   LEARNING_RATE = 3e-4
   TRAINING_STEPS = 10000
+  VAL_EVERY = 125
+  VAL_STEPS = 10
+  
   
   cfg = Config(
       D=768,
@@ -175,16 +195,19 @@ if __name__ == '__main__':
       F=4 * 768
   )
   
-  dataloader = DataLoader(BATCH_SIZE, cfg.L)
+  num_devices = jax.local_device_count()
+  
+  dataloader = DataLoader(num_devices * BATCH_SIZE, cfg.L)
   data_iter = iter(dataloader)
+  
+  val_dataloader = DataLoader(num_devices * BATCH_SIZE, cfg.L)
+  val_data_iter = iter(val_dataloader)
   
   key = jax.random.PRNGKey(0)
   key, init_key = jax.random.split(key)
   
   state = create_train_state(init_key, cfg, LEARNING_RATE)
   state = replicate(state)
-  
-  num_devices = jax.local_device_count()
   
   print("Start Training")
   for step in range(TRAINING_STEPS):
@@ -194,5 +217,20 @@ if __name__ == '__main__':
     sharded_batch = batch.reshape(num_devices, -1, batch.shape[-1])
   
     state, loss = train_step(state, sharded_batch)
-    if step % 100 == 0:
-      print(f"Step: {step}, Loss: {loss}")
+    if step % 25 == 0:
+      print(f"Step: {step}, Loss: {loss[0]:.4f}")
+    
+    if step > 0 and (step % VAL_EVERY == 0 or step == TRAINING_STEPS - 1):
+      val_loss_accumulator = jnp.zeros(())
+  
+      for _ in range(VAL_STEPS):
+        val_batch = jnp.asarray(next(val_data_iter))
+        sharded_val_batch = val_batch.reshape(num_devices, -1, val_batch.shape[-1])
+  
+        loss_per_device = eval_step(state, sharded_val_batch)
+        val_loss_accumulator += loss_per_device
+    
+      val_loss_accumulator /= VAL_STEPS
+      final_val_loss = average_across_devices(val_loss_accumulator)
+  
+      print(f"Step: {step}, Val Loss: {loss[0]:.4f}")
