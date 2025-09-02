@@ -44,7 +44,10 @@ class Config:
   N: int  # num of layers
   V: int  # vocab size
   F: int  # ffn inner dimension
-
+  kernel_init: nn.initializers.Initializer = nn.initializers.xavier_uniform()
+  embed_init: nn.initializers.Initializer = nn.initializers.variance_scaling(
+      1.0, 'fan_in', 'normal', out_axis=0
+  )
   dtype: jnp.dtype = jnp.float32
 
 class MLP(nn.Module):
@@ -52,9 +55,9 @@ class MLP(nn.Module):
 
   @nn.compact
   def __call__(self, x_BLD: jax.Array):
-    x_BLF = nn.Dense(self.cfg.F, use_bias=False)(x_BLD)
+    x_BLF = nn.Dense(self.cfg.F, kernel_init=self.cfg.kernel_init, use_bias=False)(x_BLD)
     x_BLF = nn.gelu(x_BLF)
-    x_BLD = nn.Dense(self.cfg.D, use_bias=False)(x_BLF)
+    x_BLD = nn.Dense(self.cfg.D, kernel_init=self.cfg.kernel_init, use_bias=False)(x_BLF)
 
     return x_BLD
 
@@ -67,7 +70,7 @@ class SelfAttention(nn.Module):
 
     Dh = cfg.D // cfg.H # dims per head
 
-    multilinear = partial(nn.DenseGeneral, axis=-1, features=(cfg.H, Dh), use_bias=False, dtype=cfg.dtype)
+    multilinear = partial(nn.DenseGeneral, axis=-1, features=(cfg.H, Dh), kernel_init=self.cfg.kernel_init, use_bias=False, dtype=cfg.dtype)
 
     q_BLHDh, k_BLHDh, v_BLHDh = (
         multilinear(name='query')(x_BLD),
@@ -89,7 +92,7 @@ class SelfAttention(nn.Module):
     )
     out_BLHDh = jnp.transpose(out_BHLDh, (0, 2, 1, 3))
 
-    return nn.DenseGeneral(axis=(-2,-1), features=cfg.D, name='attn_out_proj', use_bias=False, dtype=cfg.dtype)(out_BLHDh)
+    return nn.DenseGeneral(axis=(-2,-1), features=cfg.D, name='attn_out_proj', kernel_init=self.cfg.kernel_init, use_bias=False, dtype=cfg.dtype)(out_BLHDh)
 
 class Block(nn.Module):
   cfg: Config
@@ -111,8 +114,8 @@ class Transformer(nn.Module):
   def setup(self):
     cfg = self.cfg
 
-    self.embed = nn.Embed(num_embeddings=cfg.V, features=cfg.D)
-    self.pos_embed = nn.Embed(num_embeddings=cfg.L, features=cfg.D)
+    self.embed = nn.Embed(num_embeddings=cfg.V, embedding_init=cfg.embed_init, features=cfg.D)
+    self.pos_embed = nn.Embed(num_embeddings=cfg.L, embedding_init=cfg.embed_init, features=cfg.D)
 
     self.blocks = [Block(cfg) for _ in range(cfg.N)]
 
