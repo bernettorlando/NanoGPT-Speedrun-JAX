@@ -133,13 +133,20 @@ class Transformer(nn.Module):
     return self.embed.attend(y_BLD.astype(jnp.float32))
 
 
-def create_train_state(key: jax.Array, cfg: Config, learning_rate: float) -> train_state.TrainState:
+def create_train_state(key: jax.Array, cfg: Config, lr_schedule: optax.Schedule) -> train_state.TrainState:
   model = Transformer(cfg)
 
   dummy_input = jnp.ones((1, cfg.L), dtype=jnp.int32)
   params = model.init(key, dummy_input)['params']
 
-  tx = optax.adamw(learning_rate)
+  total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
+
+  print(f"Total number of parameters: {total_params:,}")
+  
+  tx = optax.chain(
+      optax.clip_by_global_norm(1.0),
+      optax.adamw(learning_rate=lr_schedule)
+  )
 
   return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
@@ -184,7 +191,8 @@ def average_across_devices(x):
 if __name__ == '__main__':
   BATCH_SIZE = 8
   LEARNING_RATE = 3e-4
-  TRAINING_STEPS = 10000
+  WARMUP_STEPS = 1250
+  TRAINING_STEPS = 20000
   VAL_EVERY = 125
   VAL_STEPS = 10
   
@@ -209,7 +217,15 @@ if __name__ == '__main__':
   key = jax.random.PRNGKey(0)
   key, init_key = jax.random.split(key)
   
-  state = create_train_state(init_key, cfg, LEARNING_RATE)
+  lr_schedule = optax.warmup_cosine_decay_schedule(
+    init_value=0.0,
+    peak_value=LEARNING_RATE,
+    warmup_steps=WARMUP_STEPS,
+    decay_steps=TRAINING_STEPS - WARMUP_STEPS,
+    end_value=LEARNING_RATE * 0.1, # Decay to 10% of peak LR
+)
+
+  state = create_train_state(init_key, cfg, lr_schedule)
   state = replicate(state)
   
   print("Start Training")
@@ -221,7 +237,9 @@ if __name__ == '__main__':
   
     state, loss = train_step(state, sharded_batch)
     if step % 25 == 0:
-      print(f"Step: {step}, Loss: {loss[0]:.4f}")
+      current_step = state.step[0]
+      current_lr = lr_schedule(current_step)
+      print(f"Step: {step}, Loss: {loss[0]:.4f}, LR: {current_lr:.7f}")
     
     if step > 0 and (step % VAL_EVERY == 0 or step == TRAINING_STEPS - 1):
       val_loss_accumulator = jnp.zeros(())
