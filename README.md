@@ -27,20 +27,42 @@ This repository is a JAX/Flax implementation of a GPT-style model, inspired by [
 
 1.  **Download the dataset.**
 
-    The training script uses the FineWeb 10B dataset. You can download it by running:
+    This project trains on the FineWeb 10B dataset. Download it with:
 
     ```bash
     python cached_fineweb10B.py
     ```
 
-    This will download the dataset into a `fineweb10B` directory.
+    Files are saved under `fineweb10B/` as `fineweb_train_*.bin` and `fineweb_val_*.bin`.
 
-2.  **Run the training script.**
+2.  **Run full training.**
 
-    Once the dataset is downloaded, you can start training the model:
+    The training script supports multi-device training (via `jax.pmap`) and automatic gradient accumulation to reach a target global token batch size. Defaults are set for a GPT‑2 small (~124M) config and ~10B training tokens.
+
+    Example (adjust `--batch_size` to what fits per device):
 
     ```bash
-    python train_gpt.py
+    python train_gpt.py \
+      --input_bin fineweb10B/fineweb_train_*.bin \
+      --input_val_bin fineweb10B/fineweb_val_*.bin \
+      --sequence_length 1024 \
+      --batch_size 4 \
+      --total_batch_size 524288 \
+      --num_iterations 18865 \
+      --val_loss_every 250
     ```
 
-    The script is configured to train a 124M parameter model and will print the loss every 100 steps. You can modify the hyperparameters in `train_gpt.py` to suit your needs.
+    Notes:
+
+    - tokens per fwd/bwd: `batch_size * sequence_length * num_devices`
+    - grad accumulation steps: `total_batch_size / tokens_per_fwd_bwd`
+    - `--dtype bfloat16` and `--flash 1` are optional on supported hardware.
+
+    The script logs train loss each step and validation loss every `--val_loss_every` steps.
+
+## Training Speed History
+
+Hardware: 8x H100 (fixed). All entries use the same training config.
+| # | Record time | Description | Date |
+| - | - | - | - |
+| 1 | 176 min | Initial baseline | 2025-09-06 |
