@@ -6,10 +6,12 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import train_state
+from flax.linen.attention import dot_product_attention as flax_dpa
 
 
 # ------------------------------
@@ -115,12 +117,17 @@ class CausalSelfAttention(nn.Module):
         qkv = nn.Dense(3 * self.cfg.n_embd, kernel_init=self.cfg.kernel_init, use_bias=True, dtype=self.cfg.dtype)(x)
         q, k, v = jnp.split(qkv, 3, axis=2)
         head_dim = self.cfg.n_embd // self.cfg.n_head
-        q = q.reshape(B, T, self.cfg.n_head, head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, T, self.cfg.n_head, head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T, self.cfg.n_head, head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(B, T, self.cfg.n_head, head_dim)
+        k = k.reshape(B, T, self.cfg.n_head, head_dim)
+        v = v.reshape(B, T, self.cfg.n_head, head_dim)
         if self.cfg.flash:
-            y = jax.nn.dot_product_attention(q, k, v, is_causal=True)
+            causal = jnp.tril(jnp.ones((T, T), dtype=bool))
+            mask = jnp.broadcast_to(causal, (B, self.cfg.n_head, T, T))
+            y = flax_dpa(q, k, v, mask=mask, dropout_rate=0.0, deterministic=True, dtype=jnp.float32, precision=None).astype(self.cfg.dtype)
         else:
+            q = q.transpose(0, 2, 1, 3)
+            k = k.transpose(0, 2, 1, 3)
+            v = v.transpose(0, 2, 1, 3)
             att = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / jnp.sqrt(head_dim)
             mask = jnp.tril(jnp.ones((T, T), dtype=bool))
             att = jnp.where(mask, att, jnp.full_like(att, -1e10))
