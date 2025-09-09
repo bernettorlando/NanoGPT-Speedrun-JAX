@@ -302,21 +302,17 @@ def main():
     print(f"tokens per fwd/bwd (global): {tokens_per_fwdbwd}")
     print(f"grad accumulation steps (Ng): {Ng}")
 
-    # LR schedule (warmup + cosine)
-    def lr_schedule_fn(it):
-        min_lr = lr * lr_decay_frac
-        warm = lr * (it + 1) / warmup_iters
-        decay_ratio = (it - warmup_iters) / (num_iterations - warmup_iters)
-        decay_ratio = jnp.clip(decay_ratio, 0, 1)
-        coeff = 0.5 * (1.0 + jnp.cos(jnp.pi * decay_ratio))
-        decay = min_lr + coeff * (lr - min_lr)
-        out = jnp.where(it < warmup_iters, warm, decay)
-        out = jnp.where(it > num_iterations, min_lr, out)
-        return out
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=lr,
+        warmup_steps=warmup_iters,
+        decay_steps=max(1, num_iterations - warmup_iters),
+        end_value=lr * lr_decay_frac,
+    )
 
     key = jax.random.PRNGKey(42)
     key, init_key = jax.random.split(key)
-    state = create_train_state(init_key, cfg, lr_schedule_fn, weight_decay)
+    state = create_train_state(init_key, cfg, lr_schedule, weight_decay)
     state = jax.device_put_replicated(state, jax.local_devices())
 
     train_step_scan = make_train_step_scan(Ng)
@@ -368,7 +364,7 @@ def main():
 
         state = update_step(state, grads)
 
-        cur_lr = float(lr_schedule_fn(step))
+        cur_lr = float(lr_schedule(step))
         print(
             f"step {step+1:4d}/{num_iterations} | train loss {float(jnp.mean(lossf)):.6f} | lr {cur_lr:.2e} | norm {float(grad_norm):.2f}"
         )
