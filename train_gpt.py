@@ -133,7 +133,8 @@ class CausalSelfAttention(nn.Module):
             att = jnp.where(mask, att, jnp.full_like(att, -1e10))
             att = jax.nn.softmax(att, axis=-1)
             y = jnp.matmul(att, v)
-        y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
+            y = y.transpose(0, 2, 1, 3)
+        y = y.reshape(B, T, C)
         residual_init = self.cfg.residual_init or self.cfg.kernel_init
         y = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(y)
         return y
