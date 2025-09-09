@@ -68,12 +68,12 @@ class DataLoader:
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
         buf = jnp.array(buf.astype(np.int32), dtype=jnp.int32)
-        x = buf[:-1].reshape(B, T)
-        y = buf[1:].reshape(B, T)
+        x_BL = buf[:-1].reshape(B, T)
+        y_BL = buf[1:].reshape(B, T)
         self.current_position += B * T
         if self.current_position + (B * T + 1) > len(self.tokens):
             self.advance()
-        return x, y
+        return x_BL, y_BL
 
 
 # ------------------------------
@@ -99,55 +99,59 @@ class MLP(nn.Module):
     cfg: Config
 
     @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(4 * self.cfg.n_embd, kernel_init=self.cfg.kernel_init, use_bias=True, dtype=self.cfg.dtype)(x)
-        x = 0.5 * x * (1.0 + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (x + 0.044715 * jnp.power(x, 3.0))))
+    def __call__(self, x_BLD):
+        x_BLD = nn.Dense(4 * self.cfg.n_embd, kernel_init=self.cfg.kernel_init, use_bias=True, dtype=self.cfg.dtype)(x_BLD)
+        x_BLD = 0.5 * x_BLD * (1.0 + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (x_BLD + 0.044715 * jnp.power(x_BLD, 3.0))))
         residual_init = self.cfg.residual_init or self.cfg.kernel_init
-        x = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(x)
-        return x
+        x_BLD = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(x_BLD)
+        return x_BLD
 
 
 class CausalSelfAttention(nn.Module):
     cfg: Config
 
     @nn.compact
-    def __call__(self, x):
-        B, T, C = x.shape
-        assert C == self.cfg.n_embd
-        qkv = nn.Dense(3 * self.cfg.n_embd, kernel_init=self.cfg.kernel_init, use_bias=True, dtype=self.cfg.dtype)(x)
-        q, k, v = jnp.split(qkv, 3, axis=2)
-        head_dim = self.cfg.n_embd // self.cfg.n_head
-        q = q.reshape(B, T, self.cfg.n_head, head_dim)
-        k = k.reshape(B, T, self.cfg.n_head, head_dim)
-        v = v.reshape(B, T, self.cfg.n_head, head_dim)
+    def __call__(self, x_BLD):
+        B, L, D = x_BLD.shape
+        assert D == self.cfg.n_embd
+        qkv_BL3D = nn.Dense(3 * self.cfg.n_embd, kernel_init=self.cfg.kernel_init, use_bias=True, dtype=self.cfg.dtype)(x_BLD)
+        q_BLD, k_BLD, v_BLD = jnp.split(qkv_BL3D, 3, axis=2)
+        Dh = self.cfg.n_embd // self.cfg.n_head
+        q_BLHDh = q_BLD.reshape(B, L, self.cfg.n_head, Dh)
+        k_BLHDh = k_BLD.reshape(B, L, self.cfg.n_head, Dh)
+        v_BLHDh = v_BLD.reshape(B, L, self.cfg.n_head, Dh)
         if self.cfg.flash:
-            causal = jnp.tril(jnp.ones((T, T), dtype=bool))
-            mask = jnp.broadcast_to(causal, (B, self.cfg.n_head, T, T))
-            y = flax_dpa(q, k, v, mask=mask, dropout_rate=0.0, deterministic=True, dtype=jnp.float32, precision=None).astype(self.cfg.dtype)
+            causal_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
+            mask_BHLL = jnp.broadcast_to(causal_LL, (B, self.cfg.n_head, L, L))
+            y_BLHDh = flax_dpa(
+                q_BLHDh, k_BLHDh, v_BLHDh,
+                mask=mask_BHLL,
+                dropout_rate=0.0, deterministic=True, dtype=jnp.float32, precision=None,
+            ).astype(self.cfg.dtype)
         else:
-            q = q.transpose(0, 2, 1, 3)
-            k = k.transpose(0, 2, 1, 3)
-            v = v.transpose(0, 2, 1, 3)
-            att = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / jnp.sqrt(head_dim)
-            mask = jnp.tril(jnp.ones((T, T), dtype=bool))
-            att = jnp.where(mask, att, jnp.full_like(att, -1e10))
-            att = jax.nn.softmax(att, axis=-1)
-            y = jnp.matmul(att, v)
-            y = y.transpose(0, 2, 1, 3)
-        y = y.reshape(B, T, C)
+            q_BHLDh = q_BLHDh.transpose(0, 2, 1, 3)
+            k_BHLDh = k_BLHDh.transpose(0, 2, 1, 3)
+            v_BHLDh = v_BLHDh.transpose(0, 2, 1, 3)
+            att_BHLL = jnp.matmul(q_BHLDh, jnp.swapaxes(k_BHLDh, -2, -1)) / jnp.sqrt(Dh)
+            mask_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
+            att_BHLL = jnp.where(mask_LL, att_BHLL, jnp.full_like(att_BHLL, -1e10))
+            att_BHLL = jax.nn.softmax(att_BHLL, axis=-1)
+            y_BHLDh = jnp.matmul(att_BHLL, v_BHLDh)
+            y_BLHDh = y_BHLDh.transpose(0, 2, 1, 3)
+        y_BLD = y_BLHDh.reshape(B, L, D)
         residual_init = self.cfg.residual_init or self.cfg.kernel_init
-        y = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(y)
-        return y
+        y_BLD = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(y_BLD)
+        return y_BLD
 
 
 class Block(nn.Module):
     cfg: Config
 
     @nn.compact
-    def __call__(self, x):
-        x = x + CausalSelfAttention(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=jnp.float32)(x))
-        x = x + MLP(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=jnp.float32)(x))
-        return x
+    def __call__(self, x_BLD):
+        x_BLD = x_BLD + CausalSelfAttention(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=jnp.float32)(x_BLD))
+        x_BLD = x_BLD + MLP(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=jnp.float32)(x_BLD))
+        return x_BLD
 
 
 class GPT(nn.Module):
@@ -160,26 +164,26 @@ class GPT(nn.Module):
         self.blocks = [Block(cfg) for _ in range(cfg.n_layer)]
         self.ln_f = nn.LayerNorm(dtype=jnp.float32, use_bias=True, epsilon=1e-5)
 
-    def __call__(self, idx, targets=None):
-        _, t = idx.shape
-        assert t <= self.cfg.block_size
-        pos = jnp.arange(0, t, dtype=jnp.int32)
-        tok_emb = self.wte(idx)
-        pos_emb = self.wpe(pos)
-        x = (tok_emb + pos_emb).astype(self.cfg.dtype)
+    def __call__(self, idx_BL, targets_BL=None):
+        _, L = idx_BL.shape
+        assert L <= self.cfg.block_size
+        pos_L = jnp.arange(0, L, dtype=jnp.int32)
+        tok_emb_BLD = self.wte(idx_BL)
+        pos_emb_LD = self.wpe(pos_L)
+        x_BLD = (tok_emb_BLD + pos_emb_LD).astype(self.cfg.dtype)
         for block in self.blocks:
-            x = block(x)
-        x = self.ln_f(x)
-        if targets is not None:
-            logits = jnp.matmul(x, self.wte.embedding.T)
+            x_BLD = block(x_BLD)
+        x_BLD = self.ln_f(x_BLD)
+        if targets_BL is not None:
+            logits_BLV = jnp.matmul(x_BLD, self.wte.embedding.T)
             loss = optax.softmax_cross_entropy_with_integer_labels(
-                logits.reshape(-1, logits.shape[-1]).astype(jnp.float32),
-                targets.reshape(-1),
+                logits_BLV.reshape(-1, logits_BLV.shape[-1]).astype(jnp.float32),
+                targets_BL.reshape(-1),
             ).mean()
-            return logits, loss
+            return logits_BLV, loss
         else:
-            logits = jnp.matmul(x[:, [-1], :], self.wte.embedding.T)
-            return logits, None
+            logits_B1V = jnp.matmul(x_BLD[:, -1:, :], self.wte.embedding.T)
+            return logits_B1V, None
 
 
 # ------------------------------
@@ -213,24 +217,22 @@ def create_train_state(key: jax.Array, cfg: Config, lr_schedule: optax.Schedule,
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-def eval_step(state: train_state.TrainState, inputs: jax.Array, labels: jax.Array):
-    _, loss = state.apply_fn({"params": state.params}, inputs, labels)
+@partial(jax.pmap, axis_name="batch")
+def eval_step(state: train_state.TrainState, inputs_BL: jax.Array, labels_BL: jax.Array):
+    _, loss = state.apply_fn({"params": state.params}, inputs_BL, labels_BL)
     return loss
 
 
-eval_step_pmap = jax.pmap(eval_step, axis_name="batch")
-
-
-def make_train_step_scan(grad_accum_steps: int):
+def make_train_step_scan(Ng: int):
     @partial(jax.pmap, axis_name="batch")
-    def train_step_scan(state: train_state.TrainState, inputs_mb: jax.Array, labels_mb: jax.Array):
-        # inputs_mb: (n_micro, B_local, T)
+    def train_step_scan(state: train_state.TrainState, inputs_NgBL: jax.Array, labels_NgBL: jax.Array):
+        # inputs_NgBL: (Ng, B_local, L)
         def body(carry, mb):
             state_in = carry
-            x_mb, y_mb = mb
+            inputs_BL, labels_BL = mb  # shapes: (B_local, L)
 
             def compute_loss(params):
-                _, loss = state_in.apply_fn({"params": params}, x_mb, y_mb)
+                _, loss = state_in.apply_fn({"params": params}, inputs_BL, labels_BL)
                 return loss
 
             loss, grads = jax.value_and_grad(compute_loss)(state_in.params)
@@ -238,7 +240,7 @@ def make_train_step_scan(grad_accum_steps: int):
             grads = jax.lax.pmean(grads, axis_name="batch")
             return carry, (grads, loss)
 
-        _, (grads_seq, loss_seq) = jax.lax.scan(body, state, (inputs_mb, labels_mb), length=grad_accum_steps)
+        _, (grads_seq, loss_seq) = jax.lax.scan(body, state, (inputs_NgBL, labels_NgBL), length=Ng)
         grads_avg = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), grads_seq)
         loss_avg = jnp.mean(loss_seq)
         return grads_avg, loss_avg
@@ -275,7 +277,7 @@ def main():
     args = parser.parse_args()
 
     print(f"JAX devices: {jax.devices()}")
-    num_devices = jax.device_count()
+    Nd = jax.device_count()
 
     batch_size = args.batch_size
     T = args.sequence_length
@@ -303,16 +305,16 @@ def main():
         flash=bool(args.flash),
     )
 
-    global_batch = batch_size * num_devices
+    global_batch = batch_size * Nd
     train_loader = DataLoader(args.input_bin, global_batch, T)
     val_loader = DataLoader(args.input_val_bin, global_batch, T) if args.input_val_bin else None
 
     # tokens per forward/backward across all devices
-    tokens_per_fwdbwd = batch_size * T * num_devices
+    tokens_per_fwdbwd = batch_size * T * Nd
     assert total_batch_size % tokens_per_fwdbwd == 0
-    grad_accum_steps = total_batch_size // tokens_per_fwdbwd
+    Ng = total_batch_size // tokens_per_fwdbwd
     print(f"tokens per fwd/bwd (global): {tokens_per_fwdbwd}")
-    print(f"grad accumulation steps: {grad_accum_steps}")
+    print(f"grad accumulation steps (Ng): {Ng}")
 
     # LR schedule (warmup + cosine)
     def lr_schedule_fn(it):
@@ -331,7 +333,7 @@ def main():
     state = create_train_state(init_key, cfg, lr_schedule_fn, weight_decay)
     state = jax.device_put_replicated(state, jax.local_devices())
 
-    train_step_scan = make_train_step_scan(grad_accum_steps)
+    train_step_scan = make_train_step_scan(Ng)
 
     print("Start Training (Nanodo-style scan + pmap)")
     for step in range(num_iterations + 1):
@@ -341,10 +343,10 @@ def main():
             val_loader.reset()
             val_loss = 0.0
             for _ in range(val_max_steps):
-                x, y = val_loader.next_batch()
-                inputs = x.reshape((num_devices, batch_size, T))
-                labels = y.reshape((num_devices, batch_size, T))
-                loss = eval_step_pmap(state, inputs, labels)
+                x_BL, y_BL = val_loader.next_batch()
+                inputs_NdBL = x_BL.reshape((Nd, batch_size, T))
+                labels_NdBL = y_BL.reshape((Nd, batch_size, T))
+                loss = eval_step(state, inputs_NdBL, labels_NdBL)
                 val_loss += jnp.mean(loss)
             val_loss /= val_max_steps
             print(f"val loss {float(val_loss):.6f}")
@@ -357,18 +359,18 @@ def main():
 
         # Collect micro-batches
         x_stack, y_stack = [], []
-        for _ in range(grad_accum_steps):
-            x_mb, y_mb = train_loader.next_batch()
-            x_stack.append(x_mb)
-            y_stack.append(y_mb)
-        x_mb = jnp.stack(x_stack, axis=0)
-        y_mb = jnp.stack(y_stack, axis=0)
-        x_mb = x_mb.reshape(grad_accum_steps, num_devices, batch_size, T)
-        y_mb = y_mb.reshape(grad_accum_steps, num_devices, batch_size, T)
-        x_mb = jnp.swapaxes(x_mb, 0, 1)  # (n_dev, n_micro, B_local, T)
-        y_mb = jnp.swapaxes(y_mb, 0, 1)
+        for _ in range(Ng):
+            x_BL, y_BL = train_loader.next_batch()
+            x_stack.append(x_BL)
+            y_stack.append(y_BL)
+        x_NgBL = jnp.stack(x_stack, axis=0)  # (Ng, B_global, L) before reshape
+        y_NgBL = jnp.stack(y_stack, axis=0)
+        x_NgNdBL = x_NgBL.reshape(Ng, Nd, batch_size, T)
+        y_NgNdBL = y_NgBL.reshape(Ng, Nd, batch_size, T)
+        x_NdNgBL = jnp.swapaxes(x_NgNdBL, 0, 1)  # (Nd, Ng, B_local, L)
+        y_NdNgBL = jnp.swapaxes(y_NgNdBL, 0, 1)
 
-        grads, lossf = train_step_scan(state, x_mb, y_mb)
+        grads, lossf = train_step_scan(state, x_NdNgBL, y_NdNgBL)
 
         # grad norm (replica 0)
         grad_norm = jnp.sqrt(
@@ -388,4 +390,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
