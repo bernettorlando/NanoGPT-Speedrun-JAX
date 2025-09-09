@@ -92,7 +92,6 @@ class Config:
     embed_init: nn.initializers.Initializer = nn.initializers.normal(stddev=0.02)
     residual_init: nn.initializers.Initializer | None = None
     dtype: jnp.dtype = jnp.float32
-    flash: bool = False
 
 
 class MLP(nn.Module):
@@ -120,24 +119,13 @@ class CausalSelfAttention(nn.Module):
         q_BLHDh = q_BLD.reshape(B, L, self.cfg.n_head, Dh)
         k_BLHDh = k_BLD.reshape(B, L, self.cfg.n_head, Dh)
         v_BLHDh = v_BLD.reshape(B, L, self.cfg.n_head, Dh)
-        if self.cfg.flash:
-            causal_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
-            mask_BHLL = jnp.broadcast_to(causal_LL, (B, self.cfg.n_head, L, L))
-            y_BLHDh = flax_dpa(
-                q_BLHDh, k_BLHDh, v_BLHDh,
-                mask=mask_BHLL,
-                dropout_rate=0.0, deterministic=True, dtype=jnp.float32, precision=None,
-            ).astype(self.cfg.dtype)
-        else:
-            q_BHLDh = q_BLHDh.transpose(0, 2, 1, 3)
-            k_BHLDh = k_BLHDh.transpose(0, 2, 1, 3)
-            v_BHLDh = v_BLHDh.transpose(0, 2, 1, 3)
-            att_BHLL = jnp.matmul(q_BHLDh, jnp.swapaxes(k_BHLDh, -2, -1)) / jnp.sqrt(Dh)
-            mask_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
-            att_BHLL = jnp.where(mask_LL, att_BHLL, jnp.full_like(att_BHLL, -1e10))
-            att_BHLL = jax.nn.softmax(att_BHLL, axis=-1)
-            y_BHLDh = jnp.matmul(att_BHLL, v_BHLDh)
-            y_BLHDh = y_BHLDh.transpose(0, 2, 1, 3)
+        causal_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
+        mask_BHLL = jnp.broadcast_to(causal_LL, (B, self.cfg.n_head, L, L))
+        y_BLHDh = flax_dpa(
+            q_BLHDh, k_BLHDh, v_BLHDh,
+            mask=mask_BHLL,
+            dropout_rate=0.0, deterministic=True, dtype=jnp.float32, precision=None,
+        ).astype(self.cfg.dtype)
         y_BLD = y_BLHDh.reshape(B, L, D)
         residual_init = self.cfg.residual_init or self.cfg.kernel_init
         y_BLD = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(y_BLD)
@@ -273,7 +261,6 @@ def main():
     parser.add_argument("--num_iterations", type=int, default=18865)
     parser.add_argument("--overfit_single_batch", type=int, default=0)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"]) 
-    parser.add_argument("--flash", type=int, default=0)
     args = parser.parse_args()
 
     print(f"JAX devices: {jax.devices()}")
@@ -302,7 +289,6 @@ def main():
         n_embd=768,
         residual_init=nn.initializers.normal(stddev=residual_std),
         dtype=dtype,
-        flash=bool(args.flash),
     )
 
     global_batch = batch_size * Nd
