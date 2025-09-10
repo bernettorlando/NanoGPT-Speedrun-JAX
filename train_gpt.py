@@ -241,13 +241,15 @@ def make_train_step_scan(Ng: int):
                 return loss
 
             loss, grads = jax.value_and_grad(compute_loss)(state_in.params)
-            loss = jax.lax.pmean(loss, axis_name="batch")
-            grads = jax.lax.pmean(grads, axis_name="batch")
             return carry, (grads, loss)
 
         _, (grads_seq, loss_seq) = jax.lax.scan(body, state, (inputs_NgBL, labels_NgBL), length=Ng)
-        grads_avg = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), grads_seq)
-        loss_avg = jnp.mean(loss_seq)
+        # Average across Ng micro-batches locally
+        grads_avg_local = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), grads_seq)
+        loss_avg_local = jnp.mean(loss_seq)
+        # Now pmean once across devices
+        grads_avg = jax.lax.pmean(grads_avg_local, axis_name="batch")
+        loss_avg = jax.lax.pmean(loss_avg_local, axis_name="batch")
         return grads_avg, loss_avg
 
     return train_step_scan
