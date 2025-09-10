@@ -37,28 +37,23 @@ This repository is a JAX/Flax implementation of a GPT-style model, inspired by [
 
 2.  **Run full training.**
 
-    The training script supports multi-device training (via `jax.pmap`) and automatic gradient accumulation to reach a target global token batch size. Defaults are set for a GPT‑2 small (~124M) config and ~10B training tokens.
+    The training script supports multi-device training (via `jax.pmap`) and automatic gradient accumulation to reach a target global token batch size. It now runs with built-in defaults (no CLI args).
 
-    Example (adjust `--batch_size` to what fits per device):
+    Run:
 
     ```bash
-    python train_gpt.py \
-      --input_bin fineweb10B/fineweb_train_*.bin \
-      --input_val_bin fineweb10B/fineweb_val_*.bin \
-      --sequence_length 1024 \
-      --batch_size 4 \
-      --total_batch_size 524288 \
-      --num_iterations 18865 \
-      --val_loss_every 250
+    python3 train_gpt.py
     ```
+
+    Defaults are defined in `train_gpt.py` under the `Hyperparameters` dataclass. To change them, edit that class (e.g., `batch_size`, `sequence_length`, `total_batch_size`, `learning_rate`, etc.).
 
     Notes:
 
     - tokens per fwd/bwd: `batch_size * sequence_length * num_devices`
-    - grad accumulation steps: `total_batch_size / tokens_per_fwd_bwd`
-    - `--dtype bfloat16` and `--flash 1` are optional on supported hardware.
+    - grad accumulation steps (Ng): `total_batch_size / tokens_per_fwd_bwd`
+    - dtype can be set via `Hyperparameters.dtype` ("float32" or "bfloat16").
 
-    The script logs train loss each step and validation loss every `--val_loss_every` steps.
+    The script logs train loss each step and validation loss every `val_loss_every` steps.
 
 ## Training Speed History
 

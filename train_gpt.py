@@ -1,4 +1,4 @@
-import argparse
+ 
 import dataclasses
 import glob
 import math
@@ -92,6 +92,23 @@ class Config:
     embed_init: nn.initializers.Initializer = nn.initializers.normal(stddev=0.02)
     residual_init: nn.initializers.Initializer | None = None
     dtype: jnp.dtype = jnp.float32
+
+
+@dataclasses.dataclass
+class Hyperparameters:
+    input_bin: str = "fineweb10B/fineweb_train_*.bin"
+    input_val_bin: str = "fineweb10B/fineweb_val_*.bin"
+    val_loss_every: int = 250
+    batch_size: int = 32  # per-device batch size
+    sequence_length: int = 1024  # L
+    total_batch_size: int = 524288  # tokens per optimizer step
+    learning_rate: float = 6e-4
+    warmup_iters: int = 700
+    learning_rate_decay_frac: float = 0.0
+    weight_decay: float = 0.1
+    num_iterations: int = 18865
+    overfit_single_batch: bool = False
+    dtype: str = "float32"  # or "bfloat16"
 
 
 class MLP(nn.Module):
@@ -247,40 +264,27 @@ def update_step(state: train_state.TrainState, grads):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_bin", type=str, default="fineweb10B/fineweb_train_*.bin")
-    parser.add_argument("--input_val_bin", type=str, default="fineweb10B/fineweb_val_*.bin")
-    parser.add_argument("--val_loss_every", type=int, default=250)
-    parser.add_argument("--batch_size", type=int, default=32, help="per-device batch size")
-    parser.add_argument("--sequence_length", type=int, default=1024)
-    parser.add_argument("--total_batch_size", type=int, default=524288, help="tokens per optimizer step")
-    parser.add_argument("--learning_rate", type=float, default=6e-4)
-    parser.add_argument("--warmup_iters", type=int, default=700)
-    parser.add_argument("--learning_rate_decay_frac", type=float, default=0.0)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--num_iterations", type=int, default=18865)
-    parser.add_argument("--overfit_single_batch", type=int, default=0)
-    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"]) 
-    args = parser.parse_args()
+    # Defaults via dataclass (no CLI args)
+    h = Hyperparameters()
 
     print(f"JAX devices: {jax.devices()}")
     Nd = jax.device_count()
 
-    batch_size = args.batch_size
-    T = args.sequence_length
-    total_batch_size = args.total_batch_size
-    lr = args.learning_rate
-    warmup_iters = args.warmup_iters
-    lr_decay_frac = args.learning_rate_decay_frac
-    weight_decay = args.weight_decay
-    num_iterations = args.num_iterations
-    val_loss_every = args.val_loss_every
+    batch_size = h.batch_size
+    T = h.sequence_length
+    total_batch_size = h.total_batch_size
+    lr = h.learning_rate
+    warmup_iters = h.warmup_iters
+    lr_decay_frac = h.learning_rate_decay_frac
+    weight_decay = h.weight_decay
+    num_iterations = h.num_iterations
+    val_loss_every = h.val_loss_every
     val_max_steps = 20
-    overfit_single_batch = bool(args.overfit_single_batch)
+    overfit_single_batch = bool(h.overfit_single_batch)
 
     # Config (GPT-2 small defaults)
     residual_std = 0.02 / math.sqrt(2 * 12)
-    dtype = jnp.float32 if args.dtype == "float32" else jnp.bfloat16
+    dtype = jnp.float32 if h.dtype == "float32" else jnp.bfloat16
     cfg = Config(
         block_size=T,
         vocab_size=50257,
@@ -292,8 +296,8 @@ def main():
     )
 
     global_batch = batch_size * Nd
-    train_loader = DataLoader(args.input_bin, global_batch, T)
-    val_loader = DataLoader(args.input_val_bin, global_batch, T) if args.input_val_bin else None
+    train_loader = DataLoader(h.input_bin, global_batch, T)
+    val_loader = DataLoader(h.input_val_bin, global_batch, T) if h.input_val_bin else None
 
     # tokens per forward/backward across all devices
     tokens_per_fwdbwd = batch_size * T * Nd
