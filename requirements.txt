@@ -3,3 +3,4 @@ optax
 huggingface-hub
 tqdm
 numpy
+tensorflow

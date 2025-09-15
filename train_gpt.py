@@ -1,7 +1,7 @@
- 
 import dataclasses
 import glob
 import math
+import time
 from functools import partial
 
 import jax
@@ -9,9 +9,14 @@ import jax.numpy as jnp
 from jax import lax
 import numpy as np
 import optax
+import tensorflow as tf
 from flax import linen as nn
 from flax.training import train_state
 from flax.linen.attention import dot_product_attention as flax_dpa
+
+
+# Prevent TensorFlow from allocating GPU memory
+tf.config.experimental.set_visible_devices([], "GPU")
 
 
 # ------------------------------
@@ -50,13 +55,13 @@ class DataLoader:
             assert shard_ntok >= B * T + 1
             total += shard_ntok
         print(f"DataLoader: {total:,} tokens across {len(self.files)} shards")
-        self.current_shard = None
-        self.reset()
+        self.current_shard = 0
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_position = 0
 
     def reset(self):
-        if self.current_shard != 0:
-            self.current_shard = 0
-            self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_shard = 0
+        self.tokens = _load_data_shard(self.files[self.current_shard])
         self.current_position = 0
 
     def advance(self):
@@ -67,19 +72,40 @@ class DataLoader:
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        buf = jnp.array(buf.astype(np.int32), dtype=jnp.int32)
-        x_BL = buf[:-1].reshape(B, T)
-        y_BL = buf[1:].reshape(B, T)
+        x_BL = np.array(buf[:-1].astype(np.int32)).reshape(B, T)
+        y_BL = np.array(buf[1:].astype(np.int32)).reshape(B, T)
         self.current_position += B * T
         if self.current_position + (B * T + 1) > len(self.tokens):
             self.advance()
         return x_BL, y_BL
 
+def data_generator(loader: DataLoader, Ng: int, Nd: int, B_local: int, T: int):
+    """A generator that yields batches for training, pre-shaped for pmap."""
+    while True:
+        # Collect a full batch for one optimizer step
+        x_stack, y_stack = [], []
+        for _ in range(Ng):
+            x_BL, y_BL = loader.next_batch()
+            x_stack.append(x_BL)
+            y_stack.append(y_BL)
+        
+        x_NgBL = np.stack(x_stack, axis=0)  # (Ng, B_global, L)
+        y_NgBL = np.stack(y_stack, axis=0)
+        
+        # Reshape for devices
+        x_NgNdBL = x_NgBL.reshape(Ng, Nd, B_local, T)
+        y_NgNdBL = y_NgBL.reshape(Ng, Nd, B_local, T)
+        
+        # Swap axes to (Nd, Ng, B_local, L) which is what pmap expects
+        x_NdNgBL = np.swapaxes(x_NgNdBL, 0, 1)
+        y_NdNgBL = np.swapaxes(y_NgNdBL, 0, 1)
+        
+        yield x_NdNgBL, y_NdNgBL
+
 
 # ------------------------------
 # Model
 # ------------------------------
-
 
 @dataclasses.dataclass
 class Config:
@@ -92,7 +118,6 @@ class Config:
     embed_init: nn.initializers.Initializer = nn.initializers.normal(stddev=0.02)
     residual_init: nn.initializers.Initializer | None = None
     dtype: jnp.dtype = jnp.float32
-
 
 @dataclasses.dataclass
 class Hyperparameters:
@@ -108,12 +133,10 @@ class Hyperparameters:
     weight_decay: float = 0.1
     num_iterations: int = 18865
     overfit_single_batch: bool = False
-    dtype: str = "float32"  # or "bfloat16"
-
+    dtype: str = "bfloat16"
 
 class MLP(nn.Module):
     cfg: Config
-
     @nn.compact
     def __call__(self, x_BLD):
         x_BLD = nn.Dense(4 * self.cfg.n_embd, kernel_init=self.cfg.kernel_init, use_bias=True, dtype=self.cfg.dtype)(x_BLD)
@@ -122,10 +145,8 @@ class MLP(nn.Module):
         x_BLD = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(x_BLD)
         return x_BLD
 
-
 class CausalSelfAttention(nn.Module):
     cfg: Config
-
     @nn.compact
     def __call__(self, x_BLD):
         B, L, D = x_BLD.shape
@@ -148,20 +169,16 @@ class CausalSelfAttention(nn.Module):
         y_BLD = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(y_BLD)
         return y_BLD
 
-
 class Block(nn.Module):
     cfg: Config
-
     @nn.compact
     def __call__(self, x_BLD):
         x_BLD = x_BLD + CausalSelfAttention(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=jnp.float32)(x_BLD))
         x_BLD = x_BLD + MLP(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=jnp.float32)(x_BLD))
         return x_BLD
 
-
 class GPT(nn.Module):
     cfg: Config
-
     def setup(self):
         cfg = self.cfg
         self.wte = nn.Embed(num_embeddings=cfg.vocab_size, features=cfg.n_embd, embedding_init=cfg.embed_init)
@@ -190,24 +207,18 @@ class GPT(nn.Module):
             logits_B1V = jnp.matmul(x_BLD[:, -1:, :], self.wte.embedding.T)
             return logits_B1V, None
 
-
 # ------------------------------
 # Train utils
 # ------------------------------
-
 
 def create_train_state(key: jax.Array, cfg: Config, lr_schedule: optax.Schedule, weight_decay: float) -> train_state.TrainState:
     model = GPT(cfg)
     dummy_input = jnp.ones((1, cfg.block_size), dtype=jnp.int32)
     dummy_targets = jnp.ones((1, cfg.block_size), dtype=jnp.int32)
     params = model.init(key, dummy_input, dummy_targets)["params"]
-
     total_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"Total parameters: {total_params:,}")
-
-    # weight decay mask: decay on 2D params, not on 1D params (bias/norm)
     decay_mask = jax.tree_util.tree_map(lambda p: p.ndim >= 2, params)
-
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.multi_transform(
@@ -218,55 +229,41 @@ def create_train_state(key: jax.Array, cfg: Config, lr_schedule: optax.Schedule,
             jax.tree_util.tree_map(lambda d: "decay" if d else "no_decay", decay_mask),
         ),
     )
-
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-
 
 @partial(jax.pmap, axis_name="batch")
 def eval_step(state: train_state.TrainState, inputs_BL: jax.Array, labels_BL: jax.Array):
     _, loss = state.apply_fn({"params": state.params}, inputs_BL, labels_BL)
     return loss
 
-
 def make_train_step_scan(Ng: int):
     @partial(jax.pmap, axis_name="batch")
     def train_step_scan(state: train_state.TrainState, inputs_NgBL: jax.Array, labels_NgBL: jax.Array):
-        # inputs_NgBL: (Ng, B_local, L)
         def body(carry, mb):
             state_in = carry
-            inputs_BL, labels_BL = mb  # shapes: (B_local, L)
-
+            inputs_BL, labels_BL = mb
             def compute_loss(params):
                 _, loss = state_in.apply_fn({"params": params}, inputs_BL, labels_BL)
                 return loss
-
             loss, grads = jax.value_and_grad(compute_loss)(state_in.params)
             return carry, (grads, loss)
-
         _, (grads_seq, loss_seq) = jax.lax.scan(body, state, (inputs_NgBL, labels_NgBL), length=Ng)
-        # Average across Ng micro-batches locally
         grads_avg_local = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), grads_seq)
         loss_avg_local = jnp.mean(loss_seq)
-        # Now pmean once across devices
         grads_avg = jax.lax.pmean(grads_avg_local, axis_name="batch")
         loss_avg = jax.lax.pmean(loss_avg_local, axis_name="batch")
         return grads_avg, loss_avg
-
     return train_step_scan
-
 
 @partial(jax.pmap, axis_name="batch")
 def update_step(state: train_state.TrainState, grads):
     return state.apply_gradients(grads=grads)
 
-
 # ------------------------------
 # Main
 # ------------------------------
 
-
 def main():
-    # Defaults via dataclass (no CLI args)
     h = Hyperparameters()
 
     print(f"JAX devices: {jax.devices()}")
@@ -284,36 +281,35 @@ def main():
     val_max_steps = 20
     overfit_single_batch = bool(h.overfit_single_batch)
 
-    # Config (GPT-2 small defaults)
     residual_std = 0.02 / math.sqrt(2 * 12)
     dtype = jnp.float32 if h.dtype == "float32" else jnp.bfloat16
     cfg = Config(
-        block_size=T,
-        vocab_size=50257,
-        n_layer=12,
-        n_head=12,
-        n_embd=768,
-        residual_init=nn.initializers.normal(stddev=residual_std),
-        dtype=dtype,
+        block_size=T, vocab_size=50257, n_layer=12, n_head=12, n_embd=768,
+        residual_init=nn.initializers.normal(stddev=residual_std), dtype=dtype,
     )
 
-    global_batch = batch_size * Nd
-    train_loader = DataLoader(h.input_bin, global_batch, T)
-    val_loader = DataLoader(h.input_val_bin, global_batch, T) if h.input_val_bin else None
+    global_batch_size = batch_size * Nd
+    train_loader = DataLoader(h.input_bin, global_batch_size, T)
+    val_loader = DataLoader(h.input_val_bin, global_batch_size, T) if h.input_val_bin else None
 
-    # tokens per forward/backward across all devices
     tokens_per_fwdbwd = batch_size * T * Nd
     assert total_batch_size % tokens_per_fwdbwd == 0
     Ng = total_batch_size // tokens_per_fwdbwd
     print(f"tokens per fwd/bwd (global): {tokens_per_fwdbwd}")
     print(f"grad accumulation steps (Ng): {Ng}")
 
+    train_ds = tf.data.Dataset.from_generator(
+        partial(data_generator, loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T),
+        output_signature=(
+            tf.TensorSpec(shape=(Nd, Ng, batch_size, T), dtype=tf.int32),
+            tf.TensorSpec(shape=(Nd, Ng, batch_size, T), dtype=tf.int32),
+        )
+    )
+    train_iterator = train_ds.prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
+
     lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=lr,
-        warmup_steps=warmup_iters,
-        decay_steps=max(1, num_iterations - warmup_iters),
-        end_value=lr * lr_decay_frac,
+        init_value=0.0, peak_value=lr, warmup_steps=warmup_iters,
+        decay_steps=max(1, num_iterations - warmup_iters), end_value=lr * lr_decay_frac,
     )
 
     key = jax.random.PRNGKey(42)
@@ -323,7 +319,7 @@ def main():
 
     train_step_scan = make_train_step_scan(Ng)
 
-    print("Start Training (Nanodo-style scan + pmap)")
+    print("Start Training")
     for step in range(num_iterations + 1):
         last_step = step == num_iterations
 
@@ -344,37 +340,30 @@ def main():
 
         if overfit_single_batch:
             train_loader.reset()
+            train_iterator = train_ds.prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
 
-        # Collect micro-batches
-        x_stack, y_stack = [], []
-        for _ in range(Ng):
-            x_BL, y_BL = train_loader.next_batch()
-            x_stack.append(x_BL)
-            y_stack.append(y_BL)
-        x_NgBL = jnp.stack(x_stack, axis=0)  # (Ng, B_global, L) before reshape
-        y_NgBL = jnp.stack(y_stack, axis=0)
-        x_NgNdBL = x_NgBL.reshape(Ng, Nd, batch_size, T)
-        y_NgNdBL = y_NgBL.reshape(Ng, Nd, batch_size, T)
-        x_NdNgBL = jnp.swapaxes(x_NgNdBL, 0, 1)  # (Nd, Ng, B_local, L)
-        y_NdNgBL = jnp.swapaxes(y_NgNdBL, 0, 1)
-
+        start_time = time.time()
+        x_NdNgBL, y_NdNgBL = next(train_iterator)
+        
         grads, lossf = train_step_scan(state, x_NdNgBL, y_NdNgBL)
 
-        # grad norm (replica 0)
         grad_norm = jnp.sqrt(
-            sum(
-                jnp.sum(jnp.square(g[0].astype(jnp.float32)))
-                for g in jax.tree_util.tree_leaves(grads)
-            )
+            sum(jnp.sum(jnp.square(g[0].astype(jnp.float32))) for g in jax.tree_util.tree_leaves(grads))
         )
-
+        
         state = update_step(state, grads)
+        
+        # Block until computations are finished to get accurate step time
+        grad_norm.block_until_ready()
+        end_time = time.time()
+        step_time_ms = (end_time - start_time) * 1000
 
         cur_lr = float(lr_schedule(step))
         print(
-            f"step {step+1:4d}/{num_iterations} | train loss {float(jnp.mean(lossf)):.6f} | lr {cur_lr:.2e} | norm {float(grad_norm):.2f}"
+            f"step {step+1:4d}/{num_iterations} | train loss {float(jnp.mean(lossf)):.6f} | "
+            f"lr {cur_lr:.2e} | norm {float(grad_norm):.2f} | "
+            f"step_time {step_time_ms:.2f}ms"
         )
-
 
 if __name__ == "__main__":
     main()
