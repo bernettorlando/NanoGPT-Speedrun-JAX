@@ -65,3 +65,4 @@ Hardware: 8x H100 (fixed). All entries use the same training config.
 | 3 | 126.4 min | Fuse train step and update | 2025-09-16 |
 | 4 | 100.6 min | Use bfloat16 for attention computation | 2025-09-16 |
 | 5 | 86.8 min | Switch to using nn.dot_product_attention with cudnn | 2025-09-16 |
+| 6 | 76.7 min | Use is_causal=True instead of explicit mask | 2025-09-16 |

@@ -148,9 +148,7 @@ class CausalSelfAttention(nn.Module):
         q_BLHDh = q_BLD.reshape(B, L, self.cfg.n_head, Dh)
         k_BLHDh = k_BLD.reshape(B, L, self.cfg.n_head, Dh)
         v_BLHDh = v_BLD.reshape(B, L, self.cfg.n_head, Dh)
-        causal_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
-        mask_BHLL = jnp.broadcast_to(causal_LL, (B, self.cfg.n_head, L, L))
-        y_BLHDh = dpa(q_BLHDh, k_BLHDh, v_BLHDh, mask=mask_BHLL, implementation="cudnn")
+        y_BLHDh = dpa(q_BLHDh, k_BLHDh, v_BLHDh, is_causal=True, implementation="cudnn")
         y_BLD = y_BLHDh.reshape(B, L, D)
         residual_init = self.cfg.residual_init or self.cfg.kernel_init
         y_BLD = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(y_BLD)
