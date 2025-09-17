@@ -9,15 +9,9 @@ import jax.numpy as jnp
 from jax import lax
 import numpy as np
 import optax
-import tensorflow as tf
 from flax import linen as nn
 from flax.training import train_state
 from flax.linen.attention import dot_product_attention as flax_dpa
-
-
-# Prevent TensorFlow from allocating GPU memory
-tf.config.experimental.set_visible_devices([], "GPU")
-
 
 # ------------------------------
 # Data
@@ -82,21 +76,18 @@ class DataLoader:
 def data_generator(loader: DataLoader, Ng: int, Nd: int, B_local: int, T: int):
     """A generator that yields batches for training, pre-shaped for pmap."""
     while True:
-        # Collect a full batch for one optimizer step
         x_stack, y_stack = [], []
         for _ in range(Ng):
             x_BL, y_BL = loader.next_batch()
             x_stack.append(x_BL)
             y_stack.append(y_BL)
         
-        x_NgBL = np.stack(x_stack, axis=0)  # (Ng, B_global, L)
+        x_NgBL = np.stack(x_stack, axis=0)
         y_NgBL = np.stack(y_stack, axis=0)
         
-        # Reshape for devices
         x_NgNdBL = x_NgBL.reshape(Ng, Nd, B_local, T)
         y_NgNdBL = y_NgBL.reshape(Ng, Nd, B_local, T)
         
-        # Swap axes to (Nd, Ng, B_local, L) which is what pmap expects
         x_NdNgBL = np.swapaxes(x_NgNdBL, 0, 1)
         y_NdNgBL = np.swapaxes(y_NgNdBL, 0, 1)
         
@@ -124,9 +115,9 @@ class Hyperparameters:
     input_bin: str = "fineweb10B/fineweb_train_*.bin"
     input_val_bin: str = "fineweb10B/fineweb_val_*.bin"
     val_loss_every: int = 250
-    batch_size: int = 32  # per-device batch size
-    sequence_length: int = 1024  # L
-    total_batch_size: int = 524288  # tokens per optimizer step
+    batch_size: int = 32
+    sequence_length: int = 1024
+    total_batch_size: int = 524288
     learning_rate: float = 6e-4
     warmup_iters: int = 700
     learning_rate_decay_frac: float = 0.0
@@ -160,8 +151,7 @@ class CausalSelfAttention(nn.Module):
         causal_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
         mask_BHLL = jnp.broadcast_to(causal_LL, (B, self.cfg.n_head, L, L))
         y_BLHDh = flax_dpa(
-            q_BLHDh, k_BLHDh, v_BLHDh,
-            mask=mask_BHLL,
+            q_BLHDh, k_BLHDh, v_BLHDh, mask=mask_BHLL,
             dropout_rate=0.0, deterministic=True, dtype=jnp.float32, precision=None,
         ).astype(self.cfg.dtype)
         y_BLD = y_BLHDh.reshape(B, L, D)
@@ -210,7 +200,6 @@ class GPT(nn.Module):
 # ------------------------------
 # Train utils
 # ------------------------------
-
 def create_train_state(key: jax.Array, cfg: Config, lr_schedule: optax.Schedule, weight_decay: float) -> train_state.TrainState:
     model = GPT(cfg)
     dummy_input = jnp.ones((1, cfg.block_size), dtype=jnp.int32)
@@ -236,10 +225,10 @@ def eval_step(state: train_state.TrainState, inputs_BL: jax.Array, labels_BL: ja
     _, loss = state.apply_fn({"params": state.params}, inputs_BL, labels_BL)
     return loss
 
-def make_train_step_scan(Ng: int):
+def make_train_step(Ng: int):
     @partial(jax.pmap, axis_name="batch")
-    def train_step_scan(state: train_state.TrainState, inputs_NgBL: jax.Array, labels_NgBL: jax.Array):
-        def body(carry, mb):
+    def train_step(state: train_state.TrainState, inputs_NgBL: jax.Array, labels_NgBL: jax.Array):
+        def grad_accumulation_body(carry, mb):
             state_in = carry
             inputs_BL, labels_BL = mb
             def compute_loss(params):
@@ -247,22 +236,28 @@ def make_train_step_scan(Ng: int):
                 return loss
             loss, grads = jax.value_and_grad(compute_loss)(state_in.params)
             return carry, (grads, loss)
-        _, (grads_seq, loss_seq) = jax.lax.scan(body, state, (inputs_NgBL, labels_NgBL), length=Ng)
+
+        _, (grads_seq, loss_seq) = jax.lax.scan(
+            grad_accumulation_body, state, (inputs_NgBL, labels_NgBL), length=Ng
+        )
+
         grads_avg_local = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), grads_seq)
         loss_avg_local = jnp.mean(loss_seq)
         grads_avg = jax.lax.pmean(grads_avg_local, axis_name="batch")
         loss_avg = jax.lax.pmean(loss_avg_local, axis_name="batch")
-        return grads_avg, loss_avg
-    return train_step_scan
-
-@partial(jax.pmap, axis_name="batch")
-def update_step(state: train_state.TrainState, grads):
-    return state.apply_gradients(grads=grads)
+        
+        new_state = state.apply_gradients(grads=grads_avg)
+        
+        grad_norm = jnp.sqrt(
+            sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads_avg))
+        )
+        
+        return new_state, loss_avg, grad_norm
+    return train_step
 
 # ------------------------------
 # Main
 # ------------------------------
-
 def main():
     h = Hyperparameters()
 
@@ -298,14 +293,9 @@ def main():
     print(f"tokens per fwd/bwd (global): {tokens_per_fwdbwd}")
     print(f"grad accumulation steps (Ng): {Ng}")
 
-    train_ds = tf.data.Dataset.from_generator(
-        partial(data_generator, loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T),
-        output_signature=(
-            tf.TensorSpec(shape=(Nd, Ng, batch_size, T), dtype=tf.int32),
-            tf.TensorSpec(shape=(Nd, Ng, batch_size, T), dtype=tf.int32),
-        )
+    train_iterator = data_generator(
+        loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T
     )
-    train_iterator = train_ds.prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
 
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=lr, warmup_steps=warmup_iters,
@@ -317,7 +307,7 @@ def main():
     state = create_train_state(init_key, cfg, lr_schedule, weight_decay)
     state = jax.device_put_replicated(state, jax.local_devices())
 
-    train_step_scan = make_train_step_scan(Ng)
+    train_step = make_train_step(Ng)
 
     print("Start Training")
     for step in range(num_iterations + 1):
@@ -340,28 +330,23 @@ def main():
 
         if overfit_single_batch:
             train_loader.reset()
-            train_iterator = train_ds.prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
+            train_iterator = data_generator(
+                loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T
+            )
 
         start_time = time.time()
         x_NdNgBL, y_NdNgBL = next(train_iterator)
         
-        grads, lossf = train_step_scan(state, x_NdNgBL, y_NdNgBL)
-
-        grad_norm = jnp.sqrt(
-            sum(jnp.sum(jnp.square(g[0].astype(jnp.float32))) for g in jax.tree_util.tree_leaves(grads))
-        )
+        state, loss, grad_norm = train_step(state, x_NdNgBL, y_NdNgBL)
         
-        state = update_step(state, grads)
-        
-        # Block until computations are finished to get accurate step time
         grad_norm.block_until_ready()
         end_time = time.time()
         step_time_ms = (end_time - start_time) * 1000
 
         cur_lr = float(lr_schedule(step))
         print(
-            f"step {step+1:4d}/{num_iterations} | train loss {float(jnp.mean(lossf)):.6f} | "
-            f"lr {cur_lr:.2e} | norm {float(grad_norm):.2f} | "
+            f"step {step+1:4d}/{num_iterations} | train loss {float(jnp.mean(loss)):.6f} | "
+            f"lr {cur_lr:.2e} | norm {float(jnp.mean(grad_norm)):.2f} | "
             f"step_time {step_time_ms:.2f}ms"
         )
 
