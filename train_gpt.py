@@ -6,12 +6,11 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from jax import lax
+from jax.nn import dot_product_attention as dpa
 import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import train_state
-from flax.linen.attention import dot_product_attention as flax_dpa
 from flax.jax_utils import prefetch_to_device
 
 # ------------------------------
@@ -151,11 +150,7 @@ class CausalSelfAttention(nn.Module):
         v_BLHDh = v_BLD.reshape(B, L, self.cfg.n_head, Dh)
         causal_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
         mask_BHLL = jnp.broadcast_to(causal_LL, (B, self.cfg.n_head, L, L))
-        y_BLHDh = flax_dpa(
-            q_BLHDh, k_BLHDh, v_BLHDh,
-            mask=mask_BHLL,
-            dropout_rate=0.0, deterministic=True, dtype=self.cfg.dtype, precision=None,
-        )
+        y_BLHDh = dpa(q_BLHDh, k_BLHDh, v_BLHDh, mask=mask_BHLL, implementation="cudnn")
         y_BLD = y_BLHDh.reshape(B, L, D)
         residual_init = self.cfg.residual_init or self.cfg.kernel_init
         y_BLD = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(y_BLD)
