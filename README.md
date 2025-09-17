@@ -62,3 +62,4 @@ Hardware: 8x H100 (fixed). All entries use the same training config.
 | - | - | - | - |
 | 1 | 176 min | Initial baseline | 2025-09-06 |
 | 2 | 138 min | Use bf16 & overlap data fetch and processing | 2025-09-14 |
+| 3 | 126.4 min | Fuse train step and update | 2025-09-16 |
