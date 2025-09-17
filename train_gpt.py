@@ -12,6 +12,7 @@ import optax
 from flax import linen as nn
 from flax.training import train_state
 from flax.linen.attention import dot_product_attention as flax_dpa
+from flax.jax_utils import prefetch_to_device
 
 # ------------------------------
 # Data
@@ -151,9 +152,10 @@ class CausalSelfAttention(nn.Module):
         causal_LL = jnp.tril(jnp.ones((L, L), dtype=bool))
         mask_BHLL = jnp.broadcast_to(causal_LL, (B, self.cfg.n_head, L, L))
         y_BLHDh = flax_dpa(
-            q_BLHDh, k_BLHDh, v_BLHDh, mask=mask_BHLL,
-            dropout_rate=0.0, deterministic=True, dtype=jnp.float32, precision=None,
-        ).astype(self.cfg.dtype)
+            q_BLHDh, k_BLHDh, v_BLHDh,
+            mask=mask_BHLL,
+            dropout_rate=0.0, deterministic=True, dtype=self.cfg.dtype, precision=None,
+        )
         y_BLD = y_BLHDh.reshape(B, L, D)
         residual_init = self.cfg.residual_init or self.cfg.kernel_init
         y_BLD = nn.Dense(self.cfg.n_embd, kernel_init=residual_init, use_bias=True, dtype=self.cfg.dtype)(y_BLD)
@@ -196,6 +198,7 @@ class GPT(nn.Module):
         else:
             logits_B1V = jnp.matmul(x_BLD[:, -1:, :], self.wte.embedding.T)
             return logits_B1V, None
+
 
 # ------------------------------
 # Train utils
@@ -254,7 +257,7 @@ def make_train_step(Ng: int):
         
         return new_state, loss_avg, grad_norm
     return train_step
-
+        
 # ------------------------------
 # Main
 # ------------------------------
@@ -296,6 +299,7 @@ def main():
     train_iterator = data_generator(
         loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T
     )
+    train_iterator = prefetch_to_device(train_iterator, size=1)
 
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=lr, warmup_steps=warmup_iters,
@@ -333,6 +337,7 @@ def main():
             train_iterator = data_generator(
                 loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T
             )
+            train_iterator = prefetch_to_device(train_iterator, size=1)
 
         start_time = time.time()
         x_NdNgBL, y_NdNgBL = next(train_iterator)
