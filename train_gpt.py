@@ -101,7 +101,7 @@ def data_generator(loader: DataLoader, Ng: int, Nd: int, B_local: int, T: int):
 @dataclasses.dataclass
 class Config:
     block_size: int = 1024
-    vocab_size: int = 50257
+    vocab_size: int = 50272
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -275,7 +275,7 @@ def main():
     residual_std = 0.02 / math.sqrt(2 * 12)
     dtype = jnp.float32 if h.dtype == "float32" else jnp.bfloat16
     cfg = Config(
-        block_size=T, vocab_size=50257, n_layer=12, n_head=12, n_embd=768,
+        block_size=T, vocab_size=50272, n_layer=12, n_head=12, n_embd=768,
         residual_init=nn.initializers.normal(stddev=residual_std), dtype=dtype,
     )
 
