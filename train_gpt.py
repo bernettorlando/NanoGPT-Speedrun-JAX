@@ -158,18 +158,18 @@ class Block(nn.Module):
     cfg: Config
     @nn.compact
     def __call__(self, x_BLD):
-        x_BLD = x_BLD + CausalSelfAttention(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=jnp.float32)(x_BLD))
-        x_BLD = x_BLD + MLP(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=jnp.float32)(x_BLD))
+        x_BLD = x_BLD + CausalSelfAttention(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=self.cfg.dtype)(x_BLD))
+        x_BLD = x_BLD + MLP(self.cfg)(nn.LayerNorm(use_bias=True, epsilon=1e-5, dtype=self.cfg.dtype)(x_BLD))
         return x_BLD
 
 class GPT(nn.Module):
     cfg: Config
     def setup(self):
         cfg = self.cfg
-        self.wte = nn.Embed(num_embeddings=cfg.vocab_size, features=cfg.n_embd, embedding_init=cfg.embed_init)
-        self.wpe = nn.Embed(num_embeddings=cfg.block_size, features=cfg.n_embd, embedding_init=cfg.embed_init)
+        self.wte = nn.Embed(num_embeddings=cfg.vocab_size, features=cfg.n_embd, embedding_init=cfg.embed_init, dtype=cfg.dtype, param_dtype=cfg.dtype)
+        self.wpe = nn.Embed(num_embeddings=cfg.block_size, features=cfg.n_embd, embedding_init=cfg.embed_init, dtype=cfg.dtype, param_dtype=cfg.dtype)
         self.blocks = [Block(cfg) for _ in range(cfg.n_layer)]
-        self.ln_f = nn.LayerNorm(dtype=jnp.float32, use_bias=True, epsilon=1e-5)
+        self.ln_f = nn.LayerNorm(dtype=cfg.dtype, use_bias=True, epsilon=1e-5)
 
     def __call__(self, idx_BL, targets_BL=None):
         _, L = idx_BL.shape
@@ -177,14 +177,14 @@ class GPT(nn.Module):
         pos_L = jnp.arange(0, L, dtype=jnp.int32)
         tok_emb_BLD = self.wte(idx_BL)
         pos_emb_LD = self.wpe(pos_L)
-        x_BLD = (tok_emb_BLD + pos_emb_LD).astype(self.cfg.dtype)
+        x_BLD = (tok_emb_BLD + pos_emb_LD)
         for block in self.blocks:
             x_BLD = block(x_BLD)
         x_BLD = self.ln_f(x_BLD)
         if targets_BL is not None:
             logits_BLV = jnp.matmul(x_BLD, self.wte.embedding.T)
             loss = optax.softmax_cross_entropy_with_integer_labels(
-                logits_BLV.reshape(-1, logits_BLV.shape[-1]).astype(jnp.float32),
+                logits_BLV.reshape(-1, logits_BLV.shape[-1]),
                 targets_BL.reshape(-1),
             ).mean()
             return logits_BLV, loss

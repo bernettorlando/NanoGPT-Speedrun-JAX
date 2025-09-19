@@ -67,3 +67,4 @@ Hardware: 8x H100 (fixed). All entries use the same training config.
 | 5 | 86.8 min | Switch to using nn.dot_product_attention with cudnn | 2025-09-16 |
 | 6 | 76.7 min | Use is_causal=True instead of explicit mask | 2025-09-16 |
 | 7 | 59.1 min | Change vocab size to 50272 (multiple of 32) | 2025-09-18 |
+| 8 | 50.9 min | Switch embed and ln to bfloat16 | 2025-09-18 |
