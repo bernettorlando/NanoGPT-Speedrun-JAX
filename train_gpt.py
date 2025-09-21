@@ -123,7 +123,6 @@ class Hyperparameters:
     learning_rate_decay_frac: float = 0.0
     weight_decay: float = 0.1
     num_iterations: int = 18865
-    overfit_single_batch: bool = False
     dtype: str = "bfloat16"
 
 class MLP(nn.Module):
@@ -270,13 +269,13 @@ def main():
     num_iterations = h.num_iterations
     val_loss_every = h.val_loss_every
     val_max_steps = 20
-    overfit_single_batch = bool(h.overfit_single_batch)
 
-    residual_std = 0.02 / math.sqrt(2 * 12)
     dtype = jnp.float32 if h.dtype == "float32" else jnp.bfloat16
+    residual_std = 0.02 / math.sqrt(2 * Config().n_layer)
     cfg = Config(
-        block_size=T, vocab_size=50272, n_layer=12, n_head=12, n_embd=768,
-        residual_init=nn.initializers.normal(stddev=residual_std), dtype=dtype,
+        block_size=T,
+        residual_init=nn.initializers.normal(stddev=residual_std),
+        dtype=dtype,
     )
 
     global_batch_size = batch_size * Nd
@@ -289,10 +288,13 @@ def main():
     print(f"tokens per fwd/bwd (global): {tokens_per_fwdbwd}")
     print(f"grad accumulation steps (Ng): {Ng}")
 
-    train_iterator = data_generator(
-        loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T
-    )
-    train_iterator = prefetch_to_device(train_iterator, size=1)
+    def build_train_iterator():
+        iterator = data_generator(
+            loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T
+        )
+        return prefetch_to_device(iterator, size=1)
+
+    train_iterator = build_train_iterator()
 
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=lr, warmup_steps=warmup_iters,
@@ -306,11 +308,30 @@ def main():
 
     train_step = make_train_step(Ng)
 
+    warmup_steps = 20
+    if warmup_steps > 0:
+        print(f"Warmup: running {warmup_steps} steps")
+        initial_state = state
+        warmup_start = time.perf_counter()
+        for _ in range(warmup_steps):
+            x_NdNgBL, y_NdNgBL = next(train_iterator)
+            state, _, grad_norm = train_step(state, x_NdNgBL, y_NdNgBL)
+            grad_norm.block_until_ready()
+        warmup_duration = time.perf_counter() - warmup_start
+        print(f"Warmup complete in {warmup_duration:.2f}s")
+        state = initial_state
+        train_loader.reset()
+        train_iterator = build_train_iterator()
+
     print("Start Training")
+    training_time_ms = 0.0
+    t0 = time.perf_counter()
     for step in range(num_iterations + 1):
         last_step = step == num_iterations
 
         if val_loss_every > 0 and (step % val_loss_every == 0 or last_step) and val_loader is not None:
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            val_start = time.perf_counter()
             val_loader.reset()
             val_loss = 0.0
             for _ in range(val_max_steps):
@@ -320,33 +341,38 @@ def main():
                 loss = eval_step(state, inputs_NdBL, labels_NdBL)
                 val_loss += jnp.mean(loss)
             val_loss /= val_max_steps
-            print(f"val loss {float(val_loss):.6f}")
+            val_duration = time.perf_counter() - val_start
+            print(
+                f"step {step:4d}/{num_iterations} | val loss {float(val_loss):.6f} | "
+                f"train_time {training_time_ms:.0f}ms | step_avg {training_time_ms / max(step, 1):.2f}ms | "
+                f"val_time {val_duration * 1000:.2f}ms"
+            )
+            t0 = time.perf_counter()
 
         if last_step:
             break
 
-        if overfit_single_batch:
-            train_loader.reset()
-            train_iterator = data_generator(
-                loader=train_loader, Ng=Ng, Nd=Nd, B_local=batch_size, T=T
-            )
-            train_iterator = prefetch_to_device(train_iterator, size=1)
-
-        start_time = time.time()
+        step_start = time.perf_counter()
         x_NdNgBL, y_NdNgBL = next(train_iterator)
         
         state, loss, grad_norm = train_step(state, x_NdNgBL, y_NdNgBL)
         
         grad_norm.block_until_ready()
-        end_time = time.time()
-        step_time_ms = (end_time - start_time) * 1000
+        step_end = time.perf_counter()
+        step_time_ms = (step_end - step_start) * 1000
+        approx_training_time_ms = training_time_ms + (step_end - t0) * 1000
 
         cur_lr = float(lr_schedule(step))
         print(
             f"step {step+1:4d}/{num_iterations} | train loss {float(jnp.mean(loss)):.6f} | "
             f"lr {cur_lr:.2e} | norm {float(jnp.mean(grad_norm)):.2f} | "
-            f"step_time {step_time_ms:.2f}ms"
+            f"step_time {step_time_ms:.2f}ms | train_time {approx_training_time_ms:.0f}ms | "
+            f"step_avg {approx_training_time_ms / (step + 1):.2f}ms"
         )
+
+    training_time_ms += 1000 * (time.perf_counter() - t0)
+    total_training_time = training_time_ms / 1000.0
+    print(f"Total training time: {total_training_time:.2f}s")
 
 if __name__ == "__main__":
     main()
